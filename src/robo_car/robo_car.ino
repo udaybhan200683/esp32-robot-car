@@ -1,9 +1,13 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <math.h>
 
 // ============================================================
 // ESP32 ROBOT CAR
-// Touch Joystick + Vertical Speed Accelerator
+// PROPORTIONAL TOUCH JOYSTICK
+// + SMALL-ANGLE STEERING
+// + MOTOR CALIBRATION TRIM
+// + VERTICAL SPEED CONTROL
 // ============================================================
 //
 // TB6612FNG
@@ -52,21 +56,69 @@ const int STBY = 33;
 // SPEED
 // ============================================================
 
-int motorSpeed = 80;
+// Actual PWM used by the motors. UI speed is 0-100%.
+// 69% of 255 ~= 176 is the experimentally stable maximum.
+const int SAFE_MAX_PWM = 176;
+int motorSpeed = 88; // 35% UI speed mapped to safe PWM
 
 const int MIN_SPEED = 40;
-const int MAX_SPEED = 255;
+const int MAX_SPEED = SAFE_MAX_PWM;
+
+// Default UI speed = 35%.
+// 35% maps to about 88 PWM.
+const int DEFAULT_UI_SPEED = 35;
 
 
 // ============================================================
-// CURRENT COMMAND
+// MOTOR CALIBRATION
 // ============================================================
+//
+// IMPORTANT:
+//
+// Start with:
+//
+// LEFT  = 1.00
+// RIGHT = 1.00
+//
+// If the car naturally moves LEFT during FORWARD,
+// reduce LEFT_MOTOR_TRIM.
+//
+// Example:
+//
+// LEFT  = 0.94
+// RIGHT = 1.00
+//
+// If the car naturally moves RIGHT,
+// reduce RIGHT_MOTOR_TRIM.
+//
+// Example:
+//
+// LEFT  = 1.00
+// RIGHT = 0.94
+//
+// Change in small steps:
+// 1.00 -> 0.98 -> 0.96 -> 0.94
+//
+// ============================================================
+
+float LEFT_MOTOR_TRIM  = 1.00;
+float RIGHT_MOTOR_TRIM = 1.00;
+
+
+// ============================================================
+// JOYSTICK
+// ============================================================
+
+float joystickX = 0.0;
+float joystickY = 0.0;
+
+bool joystickActive = false;
 
 String currentCommand = "STOP";
 
 
 // ============================================================
-// STOP
+// STOP MOTORS
 // ============================================================
 
 void stopMotors()
@@ -79,6 +131,11 @@ void stopMotors()
 
   digitalWrite(BIN1, LOW);
   digitalWrite(BIN2, LOW);
+
+  joystickX = 0.0;
+  joystickY = 0.0;
+
+  joystickActive = false;
 
   currentCommand = "STOP";
 }
@@ -96,8 +153,20 @@ void moveForward()
   digitalWrite(BIN1, HIGH);
   digitalWrite(BIN2, LOW);
 
-  analogWrite(PWMA, motorSpeed);
-  analogWrite(PWMB, motorSpeed);
+  int leftPWM =
+    (int)(motorSpeed * LEFT_MOTOR_TRIM);
+
+  int rightPWM =
+    (int)(motorSpeed * RIGHT_MOTOR_TRIM);
+
+  leftPWM =
+    constrain(leftPWM, 0, 255);
+
+  rightPWM =
+    constrain(rightPWM, 0, 255);
+
+  analogWrite(PWMA, leftPWM);
+  analogWrite(PWMB, rightPWM);
 
   currentCommand = "FORWARD";
 }
@@ -115,8 +184,20 @@ void moveBackward()
   digitalWrite(BIN1, LOW);
   digitalWrite(BIN2, HIGH);
 
-  analogWrite(PWMA, motorSpeed);
-  analogWrite(PWMB, motorSpeed);
+  int leftPWM =
+    (int)(motorSpeed * LEFT_MOTOR_TRIM);
+
+  int rightPWM =
+    (int)(motorSpeed * RIGHT_MOTOR_TRIM);
+
+  leftPWM =
+    constrain(leftPWM, 0, 255);
+
+  rightPWM =
+    constrain(rightPWM, 0, 255);
+
+  analogWrite(PWMA, leftPWM);
+  analogWrite(PWMB, rightPWM);
 
   currentCommand = "BACKWARD";
 }
@@ -134,8 +215,20 @@ void turnLeft()
   digitalWrite(BIN1, HIGH);
   digitalWrite(BIN2, LOW);
 
-  analogWrite(PWMA, motorSpeed);
-  analogWrite(PWMB, motorSpeed);
+  int leftPWM =
+    (int)(motorSpeed * LEFT_MOTOR_TRIM);
+
+  int rightPWM =
+    (int)(motorSpeed * RIGHT_MOTOR_TRIM);
+
+  leftPWM =
+    constrain(leftPWM, 0, 255);
+
+  rightPWM =
+    constrain(rightPWM, 0, 255);
+
+  analogWrite(PWMA, leftPWM);
+  analogWrite(PWMB, rightPWM);
 
   currentCommand = "LEFT";
 }
@@ -153,40 +246,441 @@ void turnRight()
   digitalWrite(BIN1, LOW);
   digitalWrite(BIN2, HIGH);
 
-  analogWrite(PWMA, motorSpeed);
-  analogWrite(PWMB, motorSpeed);
+  int leftPWM =
+    (int)(motorSpeed * LEFT_MOTOR_TRIM);
+
+  int rightPWM =
+    (int)(motorSpeed * RIGHT_MOTOR_TRIM);
+
+  leftPWM =
+    constrain(leftPWM, 0, 255);
+
+  rightPWM =
+    constrain(rightPWM, 0, 255);
+
+  analogWrite(PWMA, leftPWM);
+  analogWrite(PWMB, rightPWM);
 
   currentCommand = "RIGHT";
 }
 
 
 // ============================================================
-// APPLY CURRENT MOVEMENT
+// PROPORTIONAL DIFFERENTIAL DRIVE
+// ============================================================
+//
+// X = steering
+// Y = throttle
+//
+// X:
+// -1 = full left
+// +1 = full right
+//
+// Y:
+// -1 = reverse
+// +1 = forward
+//
 // ============================================================
 
-void applyCurrentMovement()
+void setJoystick(
+  float x,
+  float y
+)
 {
-  if (currentCommand == "FORWARD")
+  x = constrain(
+    x,
+    -1.0,
+    1.0
+  );
+
+  y = constrain(
+    y,
+    -1.0,
+    1.0
+  );
+
+
+  joystickX = x;
+  joystickY = y;
+
+
+  // ==========================================================
+  // VERY SMALL CENTER DEAD ZONE
+  //
+  // Previous version used 0.10.
+  //
+  // That was too large and caused small steering movements
+  // to be ignored.
+  //
+  // Now only about 3.5% around center is ignored.
+  // ==========================================================
+
+  const float DEAD_ZONE = 0.035;
+
+
+  float magnitude =
+    sqrt(
+      x * x +
+      y * y
+    );
+
+
+  if (
+    magnitude <
+    DEAD_ZONE
+  )
   {
-    moveForward();
+    stopMotors();
+    return;
   }
-  else if (currentCommand == "BACKWARD")
+
+
+  joystickActive = true;
+
+
+  // ==========================================================
+  // REMOVE DEAD-ZONE WITHOUT LOSING SMALL MOVEMENTS
+  // ==========================================================
+
+  float scale =
+    (magnitude - DEAD_ZONE) /
+    (1.0 - DEAD_ZONE);
+
+  scale =
+    constrain(
+      scale,
+      0.0,
+      1.0
+    );
+
+
+  if (
+    magnitude > 1.0
+  )
   {
-    moveBackward();
+    x /= magnitude;
+    y /= magnitude;
   }
-  else if (currentCommand == "LEFT")
+
+
+  x *= scale;
+  y *= scale;
+
+
+  // ==========================================================
+  // NON-LINEAR STEERING RESPONSE
+  //
+  // Small joystick movements remain very fine.
+  // Large movements become stronger.
+  // ==========================================================
+
+  float steering =
+    copysign(
+      pow(
+        fabs(x),
+        1.20
+      ),
+      x
+    );
+
+
+  float left;
+  float right;
+
+
+  // ==========================================================
+  // FORWARD / REVERSE
+  // ==========================================================
+
+  if (
+    fabs(y) > 0.035
+  )
   {
-    turnLeft();
+    // --------------------------------------------------------
+    // DIFFERENTIAL CURVE
+    //
+    // Example:
+    //
+    // Forward:
+    // left  = 1.0
+    // right = 1.0
+    //
+    // Forward-right:
+    // left  = 1.0
+    // right = 0.7
+    //
+    // Small forward-right:
+    // left  = 1.0
+    // right = 0.95
+    //
+    // --------------------------------------------------------
+
+    left =
+      y * (1.0 + steering);
+
+    right =
+      y * (1.0 - steering);
+
+
+    // --------------------------------------------------------
+    // Normalize
+    // --------------------------------------------------------
+
+    float maxValue =
+      max(
+        fabs(left),
+        fabs(right)
+      );
+
+
+    if (
+      maxValue > 1.0
+    )
+    {
+      left /= maxValue;
+      right /= maxValue;
+    }
   }
-  else if (currentCommand == "RIGHT")
+  else
   {
-    turnRight();
+    // ========================================================
+    // PURE LEFT / RIGHT
+    //
+    // Differential pivot steering.
+    // ========================================================
+
+    left =
+      steering;
+
+    right =
+      -steering;
+  }
+
+
+  // ==========================================================
+  // APPLY MOTOR CALIBRATION
+  // ==========================================================
+
+  left *= LEFT_MOTOR_TRIM;
+
+  right *= RIGHT_MOTOR_TRIM;
+
+
+  // ==========================================================
+  // PWM
+  // ==========================================================
+
+  int leftPWM =
+    (int)(
+      fabs(left) *
+      motorSpeed
+    );
+
+  int rightPWM =
+    (int)(
+      fabs(right) *
+      motorSpeed
+    );
+
+
+  leftPWM =
+    constrain(
+      leftPWM,
+      0,
+      255
+    );
+
+  rightPWM =
+    constrain(
+      rightPWM,
+      0,
+      255
+    );
+
+
+  // ==========================================================
+  // LEFT MOTOR DIRECTION
+  // ==========================================================
+
+  if (
+    left > 0.01
+  )
+  {
+    digitalWrite(
+      AIN1,
+      HIGH
+    );
+
+    digitalWrite(
+      AIN2,
+      LOW
+    );
+  }
+  else if (
+    left < -0.01
+  )
+  {
+    digitalWrite(
+      AIN1,
+      LOW
+    );
+
+    digitalWrite(
+      AIN2,
+      HIGH
+    );
+  }
+  else
+  {
+    digitalWrite(
+      AIN1,
+      LOW
+    );
+
+    digitalWrite(
+      AIN2,
+      LOW
+    );
+
+    leftPWM = 0;
+  }
+
+
+  // ==========================================================
+  // RIGHT MOTOR DIRECTION
+  // ==========================================================
+
+  if (
+    right > 0.01
+  )
+  {
+    digitalWrite(
+      BIN1,
+      HIGH
+    );
+
+    digitalWrite(
+      BIN2,
+      LOW
+    );
+  }
+  else if (
+    right < -0.01
+  )
+  {
+    digitalWrite(
+      BIN1,
+      LOW
+    );
+
+    digitalWrite(
+      BIN2,
+      HIGH
+    );
+  }
+  else
+  {
+    digitalWrite(
+      BIN1,
+      LOW
+    );
+
+    digitalWrite(
+      BIN2,
+      LOW
+    );
+
+    rightPWM = 0;
+  }
+
+
+  // ==========================================================
+  // APPLY PWM
+  // ==========================================================
+
+  analogWrite(
+    PWMA,
+    leftPWM
+  );
+
+  analogWrite(
+    PWMB,
+    rightPWM
+  );
+
+
+  // ==========================================================
+  // STATUS
+  // ==========================================================
+
+  if (
+    y > 0.08
+  )
+  {
+    if (
+      fabs(x) < 0.06
+    )
+    {
+      currentCommand =
+        "FORWARD";
+    }
+    else if (
+      x > 0
+    )
+    {
+      currentCommand =
+        "FORWARD RIGHT";
+    }
+    else
+    {
+      currentCommand =
+        "FORWARD LEFT";
+    }
+  }
+  else if (
+    y < -0.08
+  )
+  {
+    if (
+      fabs(x) < 0.06
+    )
+    {
+      currentCommand =
+        "BACKWARD";
+    }
+    else if (
+      x > 0
+    )
+    {
+      currentCommand =
+        "BACKWARD RIGHT";
+    }
+    else
+    {
+      currentCommand =
+        "BACKWARD LEFT";
+    }
+  }
+  else
+  {
+    if (
+      x > 0
+    )
+    {
+      currentCommand =
+        "RIGHT";
+    }
+    else
+    {
+      currentCommand =
+        "LEFT";
+    }
   }
 }
 
 
 // ============================================================
-// HTML PAGE
+// HTML
 // ============================================================
 
 const char MAIN_PAGE[] PROGMEM = R"rawliteral(
@@ -209,111 +703,67 @@ const char MAIN_PAGE[] PROGMEM = R"rawliteral(
 
 <title>Robot Car</title>
 
-
 <style>
-
-/* ============================================================
-   PAGE
-   ============================================================ */
 
 html,
 body
 {
   width: 100%;
   height: 100%;
-
   margin: 0;
   padding: 0;
 }
 
-
 body
 {
   background: #101010;
-
   color: white;
-
   font-family: Arial, sans-serif;
-
   overflow: hidden;
-
   user-select: none;
   -webkit-user-select: none;
-
   touch-action: none;
 }
-
-
-/* ============================================================
-   HEADER
-   ============================================================ */
 
 .header
 {
   text-align: center;
-
   height: 65px;
-
   padding-top: 8px;
-
   box-sizing: border-box;
 }
-
 
 .title
 {
   font-size: 25px;
-
   font-weight: bold;
 }
-
 
 #status
 {
   font-size: 18px;
-
   font-weight: bold;
-
   color: #00ff88;
-
   margin-top: 3px;
 }
-
-
-/* ============================================================
-   MAIN AREA
-   ============================================================ */
 
 .main
 {
   position: absolute;
-
   left: 0;
   right: 0;
-
   top: 65px;
   bottom: 0;
 }
 
-
-/* ============================================================
-   JOYSTICK
-   ============================================================ */
-
 .joystick
 {
   position: absolute;
-
   left: 50%;
-
   bottom: 18px;
-
   transform: translateX(-50%);
-
   width: 230px;
-
   height: 230px;
-
   border-radius: 50%;
 
   background:
@@ -325,297 +775,161 @@ body
     );
 
   border: 4px solid #666;
-
   box-sizing: border-box;
-
   touch-action: none;
-
   z-index: 5;
 
   box-shadow:
     0 0 20px rgba(0,0,0,0.7);
 }
 
-
-/* ============================================================
-   JOYSTICK CROSS
-   ============================================================ */
-
 .joystick::before
 {
   content: "";
-
   position: absolute;
-
   top: 10px;
   bottom: 10px;
-
   left: 50%;
-
   width: 1px;
-
   background: #444;
 }
-
 
 .joystick::after
 {
   content: "";
-
   position: absolute;
-
   left: 10px;
   right: 10px;
-
   top: 50%;
-
   height: 1px;
-
   background: #444;
 }
-
-
-/* ============================================================
-   CENTER
-   ============================================================ */
 
 .center
 {
   position: absolute;
-
   left: 50%;
   top: 50%;
-
   width: 34px;
   height: 34px;
-
-  transform:
-    translate(-50%, -50%);
-
+  transform: translate(-50%, -50%);
   border-radius: 50%;
-
   background: #444;
-
   border: 2px solid #777;
-
   pointer-events: none;
 }
-
-
-/* ============================================================
-   DIRECTION LABELS
-   ============================================================ */
 
 .jlabel
 {
   position: absolute;
-
   color: #aaa;
-
   font-size: 14px;
-
   font-weight: bold;
-
   pointer-events: none;
 }
-
 
 .jup
 {
   top: 10px;
-
   left: 50%;
-
-  transform:
-    translateX(-50%);
+  transform: translateX(-50%);
 }
-
 
 .jdown
 {
   bottom: 10px;
-
   left: 50%;
-
-  transform:
-    translateX(-50%);
+  transform: translateX(-50%);
 }
-
 
 .jleft
 {
   left: 10px;
-
   top: 50%;
-
-  transform:
-    translateY(-50%);
+  transform: translateY(-50%);
 }
-
 
 .jright
 {
   right: 10px;
-
   top: 50%;
-
-  transform:
-    translateY(-50%);
+  transform: translateY(-50%);
 }
-
-
-/* ============================================================
-   FINGER INDICATOR
-   ============================================================ */
 
 #finger
 {
   position: absolute;
-
   left: 50%;
   top: 50%;
-
   width: 48px;
   height: 48px;
-
-  transform:
-    translate(-50%, -50%);
-
+  transform: translate(-50%, -50%);
   border-radius: 50%;
-
   background: #00aa66;
-
   border: 3px solid #00ff99;
-
   display: none;
-
   pointer-events: none;
 }
-
-
-/* ============================================================
-   SPEED CONTROL AREA
-   ============================================================ */
 
 .speedArea
 {
   position: absolute;
-
   right: 12px;
-
   top: 50%;
-
-  transform:
-    translateY(-50%);
-
+  transform: translateY(-50%);
   width: 85px;
-
   height: 360px;
 
   display: flex;
-
   flex-direction: column;
-
   align-items: center;
-
   justify-content: center;
 
   z-index: 10;
-
   touch-action: none;
 }
-
-
-/* ============================================================
-   SPEED TITLE
-   ============================================================ */
 
 .speedTitle
 {
   font-size: 13px;
-
   font-weight: bold;
-
   color: #00ff99;
-
   margin-bottom: 7px;
 }
-
-
-/* ============================================================
-   SPEED TOUCH PAD
-   ============================================================ */
 
 #speedPad
 {
   position: relative;
-
   width: 70px;
-
   height: 280px;
-
   border-radius: 35px;
-
   background: #202020;
-
   border: 2px solid #555;
-
   box-sizing: border-box;
-
   touch-action: none;
-
-  /*
-     IMPORTANT:
-     Large touch area.
-  */
-
   padding: 15px;
 }
-
-
-/* ============================================================
-   INNER TRACK
-   ============================================================ */
 
 #speedTrack
 {
   position: absolute;
-
   left: 50%;
-
   top: 15px;
-
-  transform:
-    translateX(-50%);
-
+  transform: translateX(-50%);
   width: 14px;
-
   height: 250px;
-
   border-radius: 8px;
-
   background: #444;
-
   pointer-events: none;
 }
-
-
-/* ============================================================
-   ACTIVE SPEED
-   ============================================================ */
 
 #speedFill
 {
   position: absolute;
-
   left: 0;
-
   bottom: 0;
-
   width: 100%;
-
-  height: 40%;
-
+  height: 35%;
   border-radius: 8px;
 
   background:
@@ -628,32 +942,17 @@ body
   pointer-events: none;
 }
 
-
-/* ============================================================
-   ACCELERATOR PADDLE
-   ============================================================ */
-
 #speedPaddle
 {
   position: absolute;
-
   left: 50%;
-
-  bottom: 40%;
-
-  transform:
-    translate(-50%, 50%);
-
+  bottom: 35%;
+  transform: translate(-50%, 50%);
   width: 58px;
-
   height: 28px;
-
   border-radius: 14px;
-
   background: #00dd88;
-
   border: 3px solid white;
-
   box-sizing: border-box;
 
   box-shadow:
@@ -662,145 +961,98 @@ body
   pointer-events: none;
 }
 
-
-/* ============================================================
-   SPEED VALUE
-   ============================================================ */
-
 #speedValue
 {
   margin-top: 8px;
-
   font-size: 17px;
-
   font-weight: bold;
-
   color: white;
 }
-
-
-/* ============================================================
-   MAX / MIN
-   ============================================================ */
 
 .speedMax,
 .speedMin
 {
   font-size: 11px;
-
   color: #888;
 }
-
 
 .speedMax
 {
   margin-bottom: 2px;
 }
 
-
 .speedMin
 {
   margin-top: 2px;
 }
 
-
-/* ============================================================
-   SMALL SCREEN
-   ============================================================ */
-
 @media (max-height: 650px)
 {
-
   .joystick
   {
     width: 200px;
     height: 200px;
   }
 
-
   .speedArea
   {
     height: 300px;
   }
-
 
   #speedPad
   {
     height: 230px;
   }
 
-
   #speedTrack
   {
     height: 200px;
   }
 
-
   .main
   {
     top: 60px;
   }
-
 }
-
-
-/* ============================================================
-   VERY SMALL SCREEN
-   ============================================================ */
 
 @media (max-height: 520px)
 {
-
   .joystick
   {
     width: 175px;
     height: 175px;
   }
 
-
   .speedArea
   {
     right: 5px;
-
     width: 70px;
-
     height: 250px;
   }
-
 
   #speedPad
   {
     width: 58px;
-
     height: 190px;
   }
-
 
   #speedTrack
   {
     height: 165px;
   }
 
-
   #speedPaddle
   {
     width: 50px;
     height: 24px;
   }
-
 }
 
 </style>
 
 </head>
 
-
 <body>
-
-
-<!-- ========================================================
-     HEADER
-     ======================================================== -->
 
 <div class="header">
 
@@ -814,17 +1066,7 @@ body
 
 </div>
 
-
-<!-- ========================================================
-     MAIN
-     ======================================================== -->
-
 <div class="main">
-
-
-  <!-- ======================================================
-       JOYSTICK
-       ====================================================== -->
 
   <div
     id="joystick"
@@ -856,10 +1098,6 @@ body
   </div>
 
 
-  <!-- ======================================================
-       SPEED ACCELERATOR
-       ====================================================== -->
-
   <div
     id="speedArea"
     class="speedArea"
@@ -873,9 +1111,6 @@ body
       MAX
     </div>
 
-
-    <!-- LARGE TOUCH AREA -->
-
     <div id="speedPad">
 
       <div id="speedTrack">
@@ -885,15 +1120,13 @@ body
 
       </div>
 
-
       <div id="speedPaddle">
       </div>
 
     </div>
 
-
     <div id="speedValue">
-      31%
+      35%
     </div>
 
     <div class="speedMin">
@@ -902,15 +1135,13 @@ body
 
   </div>
 
-
 </div>
 
 
 <script>
 
-
 // ============================================================
-// JOYSTICK VARIABLES
+// JOYSTICK
 // ============================================================
 
 const joystick =
@@ -918,24 +1149,40 @@ const joystick =
     "joystick"
   );
 
-
 const finger =
   document.getElementById(
     "finger"
   );
-
 
 const statusText =
   document.getElementById(
     "status"
   );
 
+let joystickPointer =
+  null;
 
-let joystickPointer = null;
+let lastSendTime =
+  0;
 
-let lastCommand = "S";
 
-const DEAD_ZONE = 25;
+// Faster updates for smoother steering
+const SEND_INTERVAL =
+  35;
+
+
+// ============================================================
+// IMPORTANT
+//
+// Previous value was 25 pixels.
+//
+// That made small steering movements disappear.
+//
+// Now only 7 pixels around the exact center are ignored.
+// ============================================================
+
+const DEAD_ZONE =
+  7;
 
 
 // ============================================================
@@ -948,34 +1195,53 @@ function getJoystickCenter()
     joystick.getBoundingClientRect();
 
   return {
-    x: r.left + r.width / 2,
-    y: r.top + r.height / 2
+    x:
+      r.left +
+      r.width / 2,
+
+    y:
+      r.top +
+      r.height / 2
   };
 }
 
 
 // ============================================================
-// SEND COMMAND
+// SEND JOYSTICK
 // ============================================================
 
-function sendCommand(command)
+function sendJoystick(
+  x,
+  y,
+  force = false
+)
 {
+  const now =
+    Date.now();
+
+
   if (
-    command ===
-    lastCommand
+    !force &&
+    now - lastSendTime <
+    SEND_INTERVAL
   )
   {
     return;
   }
 
 
-  lastCommand =
-    command;
+  lastSendTime =
+    now;
 
 
   fetch(
-    "/cmd?c=" +
-    command
+    "/joy?x=" +
+    x.toFixed(4) +
+    "&y=" +
+    y.toFixed(4),
+    {
+      cache: "no-store"
+    }
   )
   .then(
     response =>
@@ -999,34 +1265,42 @@ function sendCommand(command)
 
 
 // ============================================================
-// JOYSTICK PROCESS
+// PROCESS JOYSTICK
 // ============================================================
 
 function processJoystick(
-  x,
-  y
+  clientX,
+  clientY
 )
 {
   const center =
     getJoystickCenter();
 
 
-  const dx =
-    x - center.x;
+  let dx =
+    clientX -
+    center.x;
+
+  let dy =
+    clientY -
+    center.y;
 
 
-  const dy =
-    y - center.y;
-
-
-  const distance =
+  let distance =
     Math.sqrt(
       dx * dx +
       dy * dy
     );
 
 
-  // CENTER
+  const radius =
+    joystick.clientWidth / 2 -
+    30;
+
+
+  // ==========================================================
+  // VERY SMALL CENTER AREA ONLY
+  // ==========================================================
 
   if (
     distance <
@@ -1036,31 +1310,34 @@ function processJoystick(
     finger.style.display =
       "block";
 
-
     finger.style.left =
       "50%";
-
 
     finger.style.top =
       "50%";
 
 
-    sendCommand("S");
+    sendJoystick(
+      0,
+      0
+    );
+
+    statusText.innerText =
+      "STOP";
 
     return;
   }
 
 
-  // Finger graphic
+  // ==========================================================
+  // LIMIT TO CIRCLE
+  // ==========================================================
 
-  const radius =
-    joystick.clientWidth / 2 -
-    30;
+  let fx =
+    dx;
 
-
-  let fx = dx;
-
-  let fy = dy;
+  let fy =
+    dy;
 
 
   if (
@@ -1069,25 +1346,37 @@ function processJoystick(
   )
   {
     fx =
-      dx / distance *
+      dx /
+      distance *
       radius;
 
-
     fy =
-      dy / distance *
+      dy /
+      distance *
+      radius;
+
+    dx =
+      fx;
+
+    dy =
+      fy;
+
+    distance =
       radius;
   }
 
 
+  // ==========================================================
+  // SHOW FINGER
+  // ==========================================================
+
   finger.style.display =
     "block";
-
 
   finger.style.left =
     "calc(50% + " +
     fx +
     "px)";
-
 
   finger.style.top =
     "calc(50% + " +
@@ -1095,38 +1384,133 @@ function processJoystick(
     "px)";
 
 
-  // Direction
+  // ==========================================================
+  // NORMALIZE
+  // ==========================================================
+
+  let x =
+    dx / radius;
+
+  let y =
+    -dy / radius;
+
+
+  x =
+    Math.max(
+      -1,
+      Math.min(
+        1,
+        x
+      )
+    );
+
+
+  y =
+    Math.max(
+      -1,
+      Math.min(
+        1,
+        y
+      )
+    );
+
+
+  // ==========================================================
+  // STATUS
+  // ==========================================================
+
+  const m =
+    Math.sqrt(
+      x*x +
+      y*y
+    );
+
 
   if (
-    Math.abs(dx) >
-    Math.abs(dy)
+    m < 0.04
   )
   {
-    if (dx > 0)
+    statusText.innerText =
+      "STOP";
+  }
+  else if (
+    y > 0.06
+  )
+  {
+    if (
+      Math.abs(x) < 0.04
+    )
     {
-      sendCommand("R");
+      statusText.innerText =
+        "FORWARD";
+    }
+    else if (
+      x > 0
+    )
+    {
+      statusText.innerText =
+        "FORWARD RIGHT";
     }
     else
     {
-      sendCommand("L");
+      statusText.innerText =
+        "FORWARD LEFT";
+    }
+  }
+  else if (
+    y < -0.06
+  )
+  {
+    if (
+      Math.abs(x) < 0.04
+    )
+    {
+      statusText.innerText =
+        "BACKWARD";
+    }
+    else if (
+      x > 0
+    )
+    {
+      statusText.innerText =
+        "BACKWARD RIGHT";
+    }
+    else
+    {
+      statusText.innerText =
+        "BACKWARD LEFT";
     }
   }
   else
   {
-    if (dy > 0)
+    if (
+      x > 0
+    )
     {
-      sendCommand("B");
+      statusText.innerText =
+        "RIGHT";
     }
     else
     {
-      sendCommand("F");
+      statusText.innerText =
+        "LEFT";
     }
   }
+
+
+  // ==========================================================
+  // SEND CONTINUOUS POSITION
+  // ==========================================================
+
+  sendJoystick(
+    x,
+    y
+  );
 }
 
 
 // ============================================================
-// JOYSTICK DOWN
+// POINTER DOWN
 // ============================================================
 
 joystick.addEventListener(
@@ -1154,7 +1538,7 @@ joystick.addEventListener(
 
 
 // ============================================================
-// JOYSTICK MOVE
+// POINTER MOVE
 // ============================================================
 
 joystick.addEventListener(
@@ -1182,7 +1566,7 @@ joystick.addEventListener(
 
 
 // ============================================================
-// JOYSTICK UP
+// POINTER UP
 // ============================================================
 
 joystick.addEventListener(
@@ -1206,13 +1590,21 @@ joystick.addEventListener(
       "none";
 
 
-    sendCommand("S");
+    sendJoystick(
+      0,
+      0,
+      true
+    );
+
+
+    statusText.innerText =
+      "STOP";
   }
 );
 
 
 // ============================================================
-// JOYSTICK CANCEL
+// POINTER CANCEL
 // ============================================================
 
 joystick.addEventListener(
@@ -1227,44 +1619,42 @@ joystick.addEventListener(
       "none";
 
 
-    sendCommand("S");
+    sendJoystick(
+      0,
+      0,
+      true
+    );
+
+
+    statusText.innerText =
+      "STOP";
   }
 );
 
 
 // ============================================================
-// SPEED VARIABLES
+// SPEED CONTROL
 // ============================================================
-
-const speedArea =
-  document.getElementById(
-    "speedArea"
-  );
-
 
 const speedPad =
   document.getElementById(
     "speedPad"
   );
 
-
 const speedFill =
   document.getElementById(
     "speedFill"
   );
-
 
 const speedPaddle =
   document.getElementById(
     "speedPaddle"
   );
 
-
 const speedValue =
   document.getElementById(
     "speedValue"
   );
-
 
 let speedPointer =
   null;
@@ -1287,9 +1677,9 @@ function setSpeed(
     rect.top;
 
 
-  // Limit
-
-  if (y < 0)
+  if (
+    y < 0
+  )
   {
     y = 0;
   }
@@ -1305,50 +1695,29 @@ function setSpeed(
   }
 
 
-  // ----------------------------------------------------------
-  // TOP = 100%
-  // BOTTOM = 0%
-  // ----------------------------------------------------------
-
   let percent =
     1 -
-    y / rect.height;
+    y /
+    rect.height;
 
 
-  if (percent < 0)
-  {
-    percent = 0;
-  }
-
-
-  if (percent > 1)
-  {
-    percent = 1;
-  }
-
-
-  // ----------------------------------------------------------
-  // SPEED VALUE
-  // ----------------------------------------------------------
-
-  const speed =
-    Math.round(
-      40 +
-      percent *
-      (255 - 40)
+  percent =
+    Math.max(
+      0,
+      Math.min(
+        1,
+        percent
+      )
     );
 
 
+  // UI is now a true 0-100% control.
+  // ESP32 maps 100% UI to the safe 69% PWM limit.
   const displayPercent =
     Math.round(
-      (speed / 255) *
-      100
+      percent * 100
     );
 
-
-  // ----------------------------------------------------------
-  // UPDATE GRAPHICS
-  // ----------------------------------------------------------
 
   speedFill.style.height =
     (percent * 100) +
@@ -1365,13 +1734,15 @@ function setSpeed(
     "%";
 
 
-  // ----------------------------------------------------------
-  // SEND TO ESP32
-  // ----------------------------------------------------------
-
   fetch(
     "/speed?v=" +
-    speed
+    displayPercent,
+    {
+      cache: "no-store"
+    }
+  )
+  .catch(
+    () => {}
   );
 }
 
@@ -1463,7 +1834,6 @@ speedPad.addEventListener(
   }
 );
 
-
 </script>
 
 </body>
@@ -1474,7 +1844,7 @@ speedPad.addEventListener(
 
 
 // ============================================================
-// WEB ROOT
+// ROOT
 // ============================================================
 
 void handleRoot()
@@ -1488,7 +1858,49 @@ void handleRoot()
 
 
 // ============================================================
-// COMMAND HANDLER
+// JOYSTICK
+// ============================================================
+
+void handleJoystick()
+{
+  if (
+    !server.hasArg("x") ||
+    !server.hasArg("y")
+  )
+  {
+    server.send(
+      400,
+      "text/plain",
+      "Invalid joystick"
+    );
+
+    return;
+  }
+
+
+  float x =
+    server.arg("x").toFloat();
+
+  float y =
+    server.arg("y").toFloat();
+
+
+  setJoystick(
+    x,
+    y
+  );
+
+
+  server.send(
+    200,
+    "text/plain",
+    currentCommand
+  );
+}
+
+
+// ============================================================
+// OLD COMMAND INTERFACE
 // ============================================================
 
 void handleCommand()
@@ -1511,19 +1923,27 @@ void handleCommand()
     server.arg("c");
 
 
-  if (command == "F")
+  if (
+    command == "F"
+  )
   {
     moveForward();
   }
-  else if (command == "B")
+  else if (
+    command == "B"
+  )
   {
     moveBackward();
   }
-  else if (command == "L")
+  else if (
+    command == "L"
+  )
   {
     turnLeft();
   }
-  else if (command == "R")
+  else if (
+    command == "R"
+  )
   {
     turnRight();
   }
@@ -1542,7 +1962,7 @@ void handleCommand()
 
 
 // ============================================================
-// SPEED HANDLER
+// SPEED
 // ============================================================
 
 void handleSpeed()
@@ -1561,36 +1981,54 @@ void handleSpeed()
   }
 
 
-  motorSpeed =
+  int uiSpeed =
     server.arg("v").toInt();
 
+  uiSpeed =
+    constrain(
+      uiSpeed,
+      0,
+      100
+    );
 
-  // Safety limits
-
-  if (
-    motorSpeed <
-    MIN_SPEED
-  )
-  {
-    motorSpeed =
-      MIN_SPEED;
-  }
-
-
-  if (
-    motorSpeed >
-    MAX_SPEED
-  )
-  {
-    motorSpeed =
-      MAX_SPEED;
-  }
+  // Map UI 0-100% to actual PWM.
+  // 100% UI = 176 PWM (~69% of 255).
+  motorSpeed =
+    (uiSpeed == 0) ? 0 :
+    (int)(MIN_SPEED +
+      ((float)uiSpeed / 100.0f) *
+      (SAFE_MAX_PWM - MIN_SPEED));
 
 
   // Immediately apply new speed
-  // if the car is moving.
+  // to current joystick position.
 
-  applyCurrentMovement();
+  if (
+    joystickActive
+  )
+  {
+    setJoystick(
+      joystickX,
+      joystickY
+    );
+  }
+
+
+  Serial.print(
+    "Speed UI: "
+  );
+
+  Serial.print(
+    uiSpeed
+  );
+
+  Serial.print(
+    "% -> PWM "
+  );
+
+  Serial.println(
+    motorSpeed
+  );
 
 
   server.send(
@@ -1612,7 +2050,7 @@ void setup()
   );
 
 
-  // Motor A
+  // LEFT MOTOR
 
   pinMode(
     PWMA,
@@ -1630,7 +2068,7 @@ void setup()
   );
 
 
-  // Motor B
+  // RIGHT MOTOR
 
   pinMode(
     PWMB,
@@ -1648,7 +2086,7 @@ void setup()
   );
 
 
-  // Standby
+  // STANDBY
 
   pinMode(
     STBY,
@@ -1656,19 +2094,18 @@ void setup()
   );
 
 
-  // Safe startup
+  // SAFE START
 
   digitalWrite(
     STBY,
     LOW
   );
 
-
   stopMotors();
 
-
-  delay(500);
-
+  delay(
+    500
+  );
 
   digitalWrite(
     STBY,
@@ -1677,7 +2114,7 @@ void setup()
 
 
   // ==========================================================
-  // WIFI ACCESS POINT
+  // WIFI AP
   // ==========================================================
 
   WiFi.mode(
@@ -1700,15 +2137,19 @@ void setup()
   // ==========================================================
 
   Serial.println();
+
   Serial.println(
     "======================================"
   );
+
   Serial.println(
-    "       ESP32 ROBOT CAR"
+    "          ESP32 ROBOT CAR"
   );
+
   Serial.println(
-    " TOUCH JOYSTICK + SPEED ACCELERATOR"
+    " PROPORTIONAL TOUCH JOYSTICK"
   );
+
   Serial.println(
     "======================================"
   );
@@ -1746,6 +2187,24 @@ void setup()
   );
 
 
+  Serial.print(
+    "Left motor trim: "
+  );
+
+  Serial.println(
+    LEFT_MOTOR_TRIM
+  );
+
+
+  Serial.print(
+    "Right motor trim: "
+  );
+
+  Serial.println(
+    RIGHT_MOTOR_TRIM
+  );
+
+
   // ==========================================================
   // WEB ROUTES
   // ==========================================================
@@ -1754,6 +2213,13 @@ void setup()
     "/",
     HTTP_GET,
     handleRoot
+  );
+
+
+  server.on(
+    "/joy",
+    HTTP_GET,
+    handleJoystick
   );
 
 

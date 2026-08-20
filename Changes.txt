@@ -1,0 +1,8 @@
+1. Driving is smoother
+2. Speed UI max speed adjusted to show as 100%
+3. Default initial speed set to 35% to avaoid reset.
+
+Issue:
+1. Reset happens sometimes. Need to have seprate battry for Moter or ESP. As of now 1000 micru capacitor halping alot to handle current spikes.
+2. Speed to low due to reset problem.
+3. Wheel proper alignemnt is not there.
